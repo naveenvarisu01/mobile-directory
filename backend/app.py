@@ -3,6 +3,8 @@ from flask_cors import CORS
 import json
 import os
 import re
+from datetime import datetime
+from geopy.geocoders import Nominatim
 
 app = Flask(__name__)
 
@@ -57,6 +59,47 @@ def validate_entry(entry):
 
     return errors
 
+def parse_input(text):
+    # Extract 10-digit number
+    number_match = re.search(r"[6-9]\d{9}", text)
+    if not number_match:
+        return None, "No valid mobile number found."
+    
+    number = number_match.group(0)
+    
+    # Remove number from text to get the place
+    place_text = text.replace(number, "").strip()
+    # Remove common separators
+    place_text = re.sub(r"[,.\-]", " ", place_text).strip()
+    
+    if not place_text:
+        return None, "No place found in input."
+
+    # Geocode the place
+    geolocator = Nominatim(user_agent="mobile_directory_app")
+    try:
+        location = geolocator.geocode(place_text, addressdetails=True)
+        if not location:
+            return None, f"Could not find location: {place_text}"
+        
+        address = location.raw.get("address", {})
+        district = address.get("state_district") or address.get("county") or address.get("city") or ""
+        state = address.get("state", "")
+        
+        # Fallback if district is missing but city is present
+        if not district and address.get("city"):
+            district = address.get("city")
+
+        return {
+            "number": number,
+            "place": place_text.title(), # Use the input text as the specific place name
+            "district": district,
+            "state": state
+        }, None
+
+    except Exception as e:
+        return None, f"Geocoding error: {str(e)}"
+
 @app.route("/states", methods=["GET"])
 def states():
     return jsonify(ALLOWED_STATES)
@@ -68,7 +111,19 @@ def add_number():
     except Exception:
         return jsonify({"error": "Invalid JSON body"}), 400
 
-    errors = validate_entry(entry)
+    errors = []
+    
+    # Check for smart input
+    if "text" in entry:
+        parsed, error = parse_input(entry["text"])
+        if error:
+            return jsonify({"error": error}), 400
+        entry = parsed
+        # Validate again to ensure state is allowed, etc.
+        errors = validate_entry(entry)
+    else:
+        errors = validate_entry(entry)
+
     if errors:
         return jsonify({"errors": errors}), 400
 
@@ -82,6 +137,7 @@ def add_number():
         "place": entry["place"].strip().title(),
         "district": entry["district"].strip().title(),
         "state": entry["state"].strip(),
+        "created_at": datetime.now().isoformat(),
     }
 
     data.append(normalized)
@@ -105,11 +161,26 @@ def search_number():
             continue
         results.append(d)
 
+    # Sort by created_at descending (newest first)
+    results.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+
     return jsonify(results), 200
 
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({"status": "ok"}), 200
+
+@app.route("/delete/<number>", methods=["DELETE"])
+def delete_number(number):
+    data = load_data()
+    initial_length = len(data)
+    data = [d for d in data if d.get("number") != number]
+    
+    if len(data) == initial_length:
+        return jsonify({"error": "Number not found"}), 404
+
+    save_data(data)
+    return jsonify({"message": "Number deleted successfully"}), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
